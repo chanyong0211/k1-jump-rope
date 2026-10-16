@@ -62,10 +62,24 @@ code { font-family: var(--font-data); font-size: 0.9em; }
 .formula { font-family: var(--font-data); background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 10px 14px; overflow-x: auto; }
 a { color: var(--rope); }
 footer { font-size: 13px; color: var(--muted); border-top: 1px solid var(--line); padding-top: 16px; display: grid; gap: 6px; }
+/* 고치기 막대 */
+#edit-bar { position: fixed; right: 16px; bottom: 16px; max-width: calc(100% - 32px); display: grid; gap: 8px; z-index: 10; }
+#edit-bar .bar-row, #draft-banner { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; background: var(--surface); border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px 10px; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12); font-size: 13px; }
+#edit-bar button { font: inherit; padding: 4px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); cursor: pointer; }
+#edit-bar button:disabled { opacity: 0.45; cursor: default; }
+#edit-bar button:focus-visible { outline: 2px solid var(--rope); outline-offset: 2px; }
+#btn-save:not(:disabled) { border-color: var(--rope); color: var(--rope); }
+#edit-status { color: var(--muted); }
+#edit-status.ok { color: var(--good); }
+#edit-status.err { color: var(--rope); }
+body.editing #doc { outline: 2px dashed var(--rope); outline-offset: 12px; }
+body.editing #doc [contenteditable="true"]:focus { outline: none; }
+.wrap { padding-bottom: 120px; }
 </style>
 </head>
 <body>
-<div class="wrap">
+<!--doc-start--><main id="doc" class="wrap" data-rev="1">
 
 <header>
   <div class="eyebrow">K1 휴머노이드 · MuJoCo 시뮬 타당성 검토 · 2026-10-16</div>
@@ -280,6 +294,117 @@ footer { font-size: 13px; color: var(--muted); border-top: 1px solid var(--line)
   <span>시뮬 영상은 모두 MuJoCo 3.5.0으로 렌더링했습니다.</span>
 </footer>
 
+</main><!--doc-end-->
+
+<div id="edit-bar" role="region" aria-label="페이지 고치기">
+  <div id="draft-banner" hidden>
+    <span id="draft-text"></span>
+    <button type="button" id="draft-use">초안 불러오기</button>
+    <button type="button" id="draft-drop">초안 버리기</button>
+  </div>
+  <div class="bar-row">
+    <button type="button" id="btn-edit">고치기</button>
+    <button type="button" id="btn-save" disabled>저장</button>
+    <span id="edit-status" aria-live="polite"></span>
+  </div>
 </div>
+
+<script>
+/* 고치기: 본문(#doc)을 그 자리에서 편집. 서버(docs_server.py)로 열면 저장이 index.html 에 쓰고 판을 올린다.
+   서버 없이(GitHub Pages) 열면 저장 대신 고친 index.html 을 내려받는다. 저장 전 편집은 브라우저 초안으로 남는다. */
+(function () {
+  var doc = document.getElementById("doc");
+  var BASE = parseInt(doc.getAttribute("data-rev") || "0", 10);
+  var KEY = "k1-jump-rope-draft";
+  var START = "<!" + "--doc-start-->", END = "<!" + "--doc-end-->";  // 나눠 써야 스크립트 안 문자열이 본문 표시로 안 잡힌다
+  var serverOK = false, editing = false, dirty = false;
+  var $ = function (id) { return document.getElementById(id); };
+  function lsGet() { try { return JSON.parse(localStorage.getItem(KEY) || "null"); } catch (e) { return null; } }
+  function lsSet(v) { try { localStorage.setItem(KEY, JSON.stringify(v)); } catch (e) {} }
+  function lsDel() { try { localStorage.removeItem(KEY); } catch (e) {} }
+  function status(t, kind) { var el = $("edit-status"); el.textContent = t; el.className = kind || ""; }
+  function idle() {
+    status("판 " + BASE + (dirty ? " + 저장 안 한 편집" : "") + (serverOK ? " · 서버 연결됨" : " · 서버 없음(저장 = HTML 내려받기)"));
+  }
+  function cleanHTML() {
+    var c = doc.cloneNode(true);
+    c.querySelectorAll("[contenteditable]").forEach(function (e) { e.removeAttribute("contenteditable"); });
+    return c.innerHTML;
+  }
+  function setEditing(on) {
+    editing = on;
+    if (on) {
+      doc.setAttribute("contenteditable", "true");
+      doc.querySelectorAll("figure").forEach(function (f) { f.setAttribute("contenteditable", "false"); });
+      doc.querySelectorAll("figcaption").forEach(function (c) { c.setAttribute("contenteditable", "true"); });
+    } else {
+      doc.querySelectorAll("[contenteditable]").forEach(function (e) { e.removeAttribute("contenteditable"); });
+      doc.removeAttribute("contenteditable");
+    }
+    document.body.classList.toggle("editing", on);
+    $("btn-edit").textContent = on ? "고치기 끝" : "고치기";
+    $("btn-save").disabled = !dirty;
+  }
+  function markDirty() {
+    dirty = true;
+    lsSet({ base: BASE, html: cleanHTML(), at: new Date().toISOString() });
+    $("btn-save").disabled = false;
+    idle();
+  }
+  function wrapDoc(html, rev) {
+    return START + '<main id="doc" class="wrap" data-rev="' + rev + '">' + html + '</main>' + END;
+  }
+  function download(html) {
+    fetch(location.pathname, { cache: "no-store" }).then(function (r) { return r.text(); }).then(function (src) {
+      var a = src.indexOf(START), b = src.indexOf(END);
+      if (a < 0 || b < 0) throw new Error("원본에서 본문 표시를 못 찾음");
+      var out = src.slice(0, a) + wrapDoc(html, BASE + 1) + src.slice(b + END.length);
+      var url = URL.createObjectURL(new Blob([out], { type: "text/html" }));
+      var link = document.createElement("a");
+      link.href = url; link.download = "index.html";
+      document.body.appendChild(link); link.click(); link.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 2000);
+      status("고친 index.html(판 " + (BASE + 1) + ")을 내려받았습니다. 저장소의 index.html 을 이걸로 바꾼 뒤 commit·push 하세요.", "ok");
+    }).catch(function (e) { status("내려받기 실패: " + e.message, "err"); });
+  }
+  function save() {
+    var html = cleanHTML();
+    if (!serverOK) { download(html); return; }
+    status("저장 중…");
+    fetch("__doc_api/save", { method: "POST", headers: { "Content-Type": "application/json", "X-Base-Rev": String(BASE) },
+                              body: JSON.stringify({ rev: BASE + 1, html: html }) })
+      .then(function (r) { return r.text().then(function (t) { return { ok: r.ok, code: r.status, txt: t }; }); })
+      .then(function (r) {
+        if (r.ok) {
+          BASE += 1; doc.setAttribute("data-rev", String(BASE)); dirty = false; lsDel();
+          $("btn-save").disabled = true;
+          status("판 " + BASE + " 저장했습니다. GitHub 에 올리려면 commit·push 가 필요합니다.", "ok");
+        } else if (r.code === 409) {
+          status("저장 거절: 서버에 더 새 판이 있습니다(" + r.txt + "). 편집은 브라우저 초안에 남아 있습니다 — 새로고침 후 초안을 불러와 다시 맞추세요.", "err");
+        } else {
+          status("저장 실패(" + r.code + "): " + r.txt, "err");
+        }
+      })
+      .catch(function (e) { status("저장 실패: " + e.message, "err"); });
+  }
+  doc.addEventListener("input", function () { if (editing) markDirty(); });
+  $("btn-edit").onclick = function () { setEditing(!editing); };
+  $("btn-save").onclick = save;
+  document.addEventListener("keydown", function (e) {
+    if ((e.ctrlKey || e.metaKey) && e.key === "s" && dirty) { e.preventDefault(); save(); }
+  });
+  window.addEventListener("beforeunload", function (e) { if (dirty) { e.preventDefault(); e.returnValue = ""; } });
+
+  var draft = lsGet();
+  if (draft && draft.html) {
+    $("draft-text").textContent = "저장 안 한 초안이 있습니다(판 " + draft.base + " 위에서 고침, " + (draft.at ? new Date(draft.at).toLocaleString("ko-KR") : "") + ")" +
+      (draft.base !== BASE ? " — 지금 페이지는 판 " + BASE + "이라, 불러오면 그 사이 바뀐 내용을 덮어씁니다." : ".");
+    $("draft-banner").hidden = false;
+    $("draft-use").onclick = function () { doc.innerHTML = draft.html; $("draft-banner").hidden = true; setEditing(true); markDirty(); };
+    $("draft-drop").onclick = function () { lsDel(); $("draft-banner").hidden = true; };
+  }
+  fetch("__doc_api/ping", { cache: "no-store" }).then(function (r) { serverOK = r.ok; }).catch(function () { serverOK = false; }).then(idle);
+})();
+</script>
 </body>
 </html>
